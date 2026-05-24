@@ -1,0 +1,306 @@
+================================================================================
+  PROWIDER — Mini Lead Distribution System
+  Full Stack Developer Assignment Submission
+================================================================================
+
+
+================================================================================
+  SETUP INSTRUCTIONS
+================================================================================
+
+Prerequisites:
+  - Node.js 18+ installed
+  - MongoDB Atlas account (or local MongoDB instance)
+  - Git installed
+
+Step 1: Clone the Repository
+  git clone <repository-url>
+  cd prowider-app
+
+Step 2: Install Dependencies
+  npm install
+
+Step 3: Configure Environment Variables
+  - Copy the example file:
+      cp .env.example .env.local
+  - Edit .env.local and set your MongoDB connection URI:
+      MONGODB_URI=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/prowider?retryWrites=true&w=majority
+  - The app supports both mongodb:// and mongodb+srv:// URI formats.
+
+Step 4: Seed the Database
+  Option A — Via CLI (recommended for first-time setup):
+      npm run seed
+  Option B — Via the app (after starting the dev server):
+      Navigate to /test-tools and click "Seed Database"
+
+Step 5: Run the Development Server
+  npm run dev
+  Open http://localhost:3000 in your browser.
+
+Step 6: Verify Everything Works
+  1. Visit /request-service → Submit a test lead
+  2. Visit /dashboard → Confirm the lead appears with assigned providers
+  3. Visit /test-tools → Test webhook idempotency and concurrent lead generation
+
+Deployment to Vercel:
+  1. Push the repository to GitHub
+  2. Import the project in Vercel (https://vercel.com/new)
+  3. Set the Root Directory to "prowider-app" (if the repo root contains it)
+  4. Add the environment variable in Vercel project settings:
+       MONGODB_URI = <your MongoDB Atlas connection string>
+  5. Deploy — Vercel auto-detects Next.js and builds accordingly
+  6. After deployment, visit <your-vercel-url>/test-tools and click
+     "Seed Database" to initialize the production database
+  7. Important: Ensure your MongoDB Atlas cluster has the Vercel IP
+     addresses whitelisted (or allow access from anywhere: 0.0.0.0/0)
+
+
+================================================================================
+  ALLOCATION ALGORITHM
+================================================================================
+
+Overview:
+  Every lead must be assigned to exactly 3 providers. The allocation follows
+  a two-phase process: mandatory assignment first, then fair round-robin
+  distribution for remaining slots.
+
+Phase 1 — Mandatory Provider Assignment:
+  Certain providers MUST receive leads for specific services (if they have
+  remaining quota). The rules are hardcoded as business requirements:
+
+    Service 1 → Provider 1 must always receive
+    Service 2 → Provider 5 must always receive
+    Service 3 → Provider 1 AND Provider 4 must always receive
+
+  For each mandatory provider, we attempt an atomic quota decrement using
+  MongoDB's findOneAndUpdate with a condition { monthlyQuota: { $gt: 0 } }.
+  If the provider has quota remaining, the decrement succeeds atomically
+  and the provider is added to the assigned list. If quota is exhausted,
+  the mandatory provider is skipped.
+
+Phase 2 — Fair Round-Robin Distribution:
+  After mandatory assignments, remaining slots (up to 3 total) are filled
+  from a service-specific pool of eligible providers:
+
+    Service 1 → Pool: [Provider 2, Provider 3, Provider 4]
+    Service 2 → Pool: [Provider 6, Provider 7, Provider 8]
+    Service 3 → Pool: [Provider 2, Provider 3, Provider 5, Provider 6,
+                        Provider 7, Provider 8]
+
+  The round-robin works as follows:
+
+  1. An AllocationState document is stored in MongoDB for each service,
+     containing a persistent `nextIndex` field.
+
+  2. When a slot needs to be filled, we call `advanceRoundRobin()` which
+     uses MongoDB's atomic `findOneAndUpdate` with `$inc: { nextIndex: 1 }`
+     to atomically read the current index and increment it. This returns
+     the index BEFORE the increment (the one to use for this allocation).
+
+  3. The index is taken modulo the pool size to determine which provider
+     in the pool to try first.
+
+  4. Starting from that position, we iterate through the pool in order.
+     For each candidate, we attempt an atomic quota decrement. The first
+     provider that succeeds (has quota) gets the slot.
+
+  5. Since the `nextIndex` persists in the database, the round-robin
+     state survives server restarts, redeployments, and serverless cold
+     starts.
+
+  Why this is fair (not random):
+  - Each service's round-robin pointer advances by 1 for each allocation,
+    ensuring every pool provider gets a turn before any provider repeats.
+  - The pointer persists across server restarts (stored in MongoDB).
+  - Providers who have exhausted their quota are naturally skipped.
+  - This guarantees even distribution over time, unlike random selection
+    which can cluster assignments on the same provider.
+
+
+================================================================================
+  CONCURRENCY HANDLING
+================================================================================
+
+The system is designed to handle multiple simultaneous lead submissions
+correctly. Here is how concurrency is handled at each critical point:
+
+1. Atomic Quota Decrement (Provider.findOneAndUpdate):
+   The core of concurrency safety is the `tryDecrementQuota()` function:
+
+     Provider.findOneAndUpdate(
+       { providerId, monthlyQuota: { $gt: 0 } },
+       { $inc: { monthlyQuota: -1, leadsReceived: 1 } },
+       { new: true }
+     )
+
+   This is a single atomic MongoDB operation. The query condition
+   { monthlyQuota: { $gt: 0 } } and the update { $inc: { monthlyQuota: -1 } }
+   execute atomically — meaning even if two requests hit simultaneously, only
+   one will succeed in decrementing from 1 to 0. The other will find the
+   condition no longer matches and return null (indicating quota exhausted).
+
+   This prevents:
+   - Over-allocation beyond the monthly quota of 10
+   - Two concurrent requests both reading quota=1 and both decrementing
+
+2. Atomic Round-Robin Advancement (AllocationState.findOneAndUpdate):
+   The round-robin index is advanced using:
+
+     AllocationState.findOneAndUpdate(
+       { serviceId },
+       { $inc: { nextIndex: 1 } },
+       { new: false }  // returns the document BEFORE the increment
+     )
+
+   Because MongoDB's $inc is atomic, two concurrent allocations will each
+   get a DIFFERENT nextIndex value. This means concurrent leads for the
+   same service will be routed to different providers in the pool, even
+   if they execute at the exact same time.
+
+3. Duplicate Lead Prevention (MongoDB Unique Index):
+   The Lead model has a compound unique index:
+
+     LeadSchema.index({ phone: 1, serviceId: 1 }, { unique: true })
+
+   This is enforced at the DATABASE level, not just in application code.
+   If two identical form submissions arrive simultaneously, MongoDB will
+   allow the first insert and reject the second with error code 11000
+   (duplicate key). The API catches this and returns HTTP 409 Conflict.
+
+4. Concurrent Test Endpoint:
+   The /api/test/gen-leads endpoint uses Promise.allSettled() to fire
+   all lead creations concurrently, simulating real-world simultaneous
+   submissions. The atomic operations above ensure correctness even when
+   all 10 leads are processed at the same time.
+
+
+================================================================================
+  WEBHOOK IDEMPOTENCY
+================================================================================
+
+The webhook endpoint (POST /api/webhook/reset-quota) simulates a payment
+gateway confirming a subscription renewal. It resets all provider quotas
+to 10. Idempotency is ensured through the following mechanism:
+
+1. Every webhook call must include a unique `eventId` in the request body.
+   This eventId represents a single real-world event (e.g., one payment
+   confirmation).
+
+2. The WebhookEvent model has a unique index on eventId:
+
+     WebhookEventSchema = {
+       eventId: { type: String, required: true, unique: true },
+       type: { type: String, required: true },
+       processedAt: { type: Date, default: Date.now }
+     }
+
+3. When a webhook request arrives, we FIRST attempt to insert a new
+   WebhookEvent document with that eventId:
+
+     await WebhookEvent.create({ eventId, type: "quota_reset" })
+
+   - If the insert SUCCEEDS: this is the first time we've seen this
+     eventId. We proceed to execute the side effects (resetting quotas).
+
+   - If the insert FAILS with MongoDB error code 11000 (duplicate key):
+     this eventId was already processed. We return a success response
+     with { alreadyProcessed: true } without executing any side effects.
+
+4. This approach is race-condition safe. Even if the same eventId is sent
+   5 times concurrently:
+   - MongoDB's unique index guarantees only ONE insert will succeed
+   - The other 4 will get duplicate key errors
+   - Only one quota reset will actually execute
+   - The others will return "already processed"
+
+5. The Test Tools page (/test-tools) demonstrates this:
+   - "Reset Provider Quota" sends a unique eventId each time (always works)
+   - "Call Webhook 5× Same ID" sends the same eventId 5 times concurrently
+     to prove that only 1 out of 5 calls actually processes the reset
+
+6. Key design decision: We use "insert-first, then process" rather than
+   "check-then-insert" to avoid a TOCTOU (Time-of-Check-Time-of-Use) race
+   condition. The database's unique constraint is the single source of truth
+   for idempotency.
+
+
+================================================================================
+  TECH STACK
+================================================================================
+
+  Frontend:       Next.js 16, React 19, Chakra UI v2
+  Backend:        Next.js API Routes (App Router)
+  Database:       MongoDB (via MongoDB Atlas) with Mongoose ODM
+  Validation:     Zod schema validation on API inputs
+  Real-Time:      Server-Sent Events (SSE) for dashboard live updates
+  Deployment:     Vercel (serverless)
+
+================================================================================
+  PROJECT STRUCTURE
+================================================================================
+
+  prowider-app/
+  ├── app/
+  │   ├── api/
+  │   │   ├── leads/route.ts          # POST: Create lead + allocate providers
+  │   │   ├── providers/route.ts      # GET: Provider stats + assigned leads
+  │   │   ├── seed/route.ts           # POST: Seed database
+  │   │   ├── sse/dashboard/route.ts  # GET: SSE stream for real-time updates
+  │   │   ├── test/gen-leads/route.ts # POST: Generate concurrent test leads
+  │   │   └── webhook/reset-quota/route.ts  # POST: Idempotent quota reset
+  │   ├── dashboard/page.tsx          # Provider dashboard with live updates
+  │   ├── request-service/page.tsx    # Customer service request form
+  │   ├── test-tools/page.tsx         # Testing panel (webhook, concurrency)
+  │   ├── layout.tsx                  # Root layout with Chakra provider
+  │   ├── providers.tsx               # Chakra UI provider wrapper
+  │   ├── theme.ts                    # Custom Chakra theme
+  │   └── globals.css                 # Global styles
+  ├── components/
+  │   ├── LandingContent.tsx          # Landing page hero + features
+  │   └── Navbar.tsx                  # Navigation bar
+  ├── lib/
+  │   ├── allocation.ts               # Core allocation engine (round-robin)
+  │   ├── db.ts                       # MongoDB connection (cached singleton)
+  │   ├── sse.ts                      # SSE broadcast manager
+  │   └── models/
+  │       ├── AllocationState.ts      # Round-robin state per service
+  │       ├── Lead.ts                 # Lead with phone+service unique index
+  │       ├── Provider.ts             # Provider with quota tracking
+  │       ├── Service.ts              # Service definitions
+  │       └── WebhookEvent.ts         # Processed webhook events (idempotency)
+  └── seed/
+      └── seed.ts                     # CLI seed script
+
+================================================================================
+  DATABASE DESIGN
+================================================================================
+
+  Collections:
+
+  1. services
+     - serviceId (Number, unique)
+     - name (String)
+
+  2. providers
+     - providerId (Number, unique)
+     - name (String)
+     - monthlyQuota (Number, default 10) — decremented atomically per lead
+     - leadsReceived (Number, default 0) — incremented atomically per lead
+
+  3. leads
+     - name, phone, city, serviceId, serviceName, description
+     - assignedProviders (Array of provider IDs)
+     - Unique compound index: { phone: 1, serviceId: 1 }
+     - Timestamps enabled (createdAt, updatedAt)
+
+  4. allocationstates
+     - serviceId (Number, unique)
+     - pool (Array of provider IDs eligible for round-robin)
+     - nextIndex (Number) — persistent round-robin pointer
+
+  5. webhookevents
+     - eventId (String, unique) — idempotency key
+     - type (String)
+     - processedAt (Date)
+
+================================================================================
