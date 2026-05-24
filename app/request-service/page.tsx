@@ -45,7 +45,7 @@ export default function RequestServicePage() {
     const errs: Record<string, string> = {};
     if (!form.name.trim()) errs.name = "Name is required";
     if (!form.phone.trim()) errs.phone = "Phone is required";
-    else if (!/^\\d{10,}$/.test(form.phone.trim()))
+    else if (!/^\d{10,}$/.test(form.phone.trim()))
       errs.phone = "Enter a valid phone number (digits only, min 10)";
     if (!form.city.trim()) errs.city = "City is required";
     if (!form.serviceId) errs.serviceId = "Please select a service";
