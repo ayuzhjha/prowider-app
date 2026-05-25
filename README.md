@@ -13,7 +13,7 @@ A full-stack lead generation and distribution platform built with **Next.js 14**
 ### 1. Clone & Install
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/ayuzhjha/prowider-app
 cd prowider-app
 npm install
 ```
